@@ -86,17 +86,39 @@ class TFMatMul():
         super().__init__()
         self.first_operand, self.second_operand = get_number(tensor_grap, node_weights, node_inputs)
         self.trans_in, self.trans_out = None, None
-        if self.first_operand.shape[-1] != self.second_operand.shape[0] or len(self.second_operand.shape) == 2:
+
+        self.mha = False
+        self.trans_first, self.trans_second = None, None
+        # multi-head attention
+        if len(self.first_operand.shape) == 3 and len(self.second_operand.shape) == 3:
+            self.mha = True
+            self.trans_first = [0, 2, 1]
+            self.trans_second = [0, 2, 1]
+            self.trans_out = [0, 2, 1]
+
+        elif self.first_operand.shape[-1] != self.second_operand.shape[0] or len(self.second_operand.shape) == 2:
             # channel轴变化遇上广播，这感觉真的来劲
             shape_len = len(tensor_grap[node_inputs[0]].shape)
             self.trans_in = [0, shape_len-1] + [n for n in range(1, shape_len-1)]
             self.trans_out = [0] + [n for n in range(2, len(self.first_operand.shape))] + [1]
 
     def __call__(self, *args, **kwargs):
-        if self.trans_in:
+        if self.mha:
+            _first = tf.transpose(self.first_operand, perm=self.trans_first)
+            _second = tf.transpose(self.second_operand, perm=self.trans_second)
+            out = tf.matmul(_first, _second)
+            out = tf.transpose(out, perm=self.trans_out)
+            return out
+
+        elif self.trans_in:
+            print("first", self.first_operand.shape)
             temp = tf.transpose(self.first_operand, perm=self.trans_in)
+            print("first-transp", temp.shape)
+            print("second", self.second_operand.shape)
             temp = tf.matmul(temp, self.second_operand)
+            print("result", temp.shape)
             temp = tf.transpose(temp, perm=self.trans_out)
+            print("result-transp", temp.shape)
             return temp
         else:
             return tf.matmul(self.first_operand, self.second_operand)
