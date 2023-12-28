@@ -2,7 +2,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 from .dimension_utils import channel_to_last_dimension
-from . import OPERATOR
+from ..utils.op_registry import OPERATOR
 
 @OPERATOR.register_operator("Relu")
 class TFRelu():

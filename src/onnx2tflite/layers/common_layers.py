@@ -4,7 +4,8 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-from . import OPERATOR
+from ..utils.op_registry import OPERATOR
+from .dimension_utils import intfloat_to_list
 
 LOG = logging.getLogger("common_layers :")
 
@@ -60,8 +61,14 @@ class TFPad():
 class TFClip():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs):
         super().__init__()
-        self.min = tensor_grap[node_inputs[1]] if node_inputs[1] in tensor_grap else node_weights[node_inputs[1]]
-        self.max = tensor_grap[node_inputs[2]] if node_inputs[2] in tensor_grap else node_weights[node_inputs[2]]
+        if "min" in node_attribute:
+            self.min = node_attribute.get("min")
+        else:
+            self.min = tensor_grap[node_inputs[1]] if node_inputs[1] in tensor_grap else node_weights[node_inputs[1]]
+        if "max" in node_attribute:
+            self.max = node_attribute.get("max")
+        else:
+            self.max = tensor_grap[node_inputs[2]] if node_inputs[2] in tensor_grap else node_weights[node_inputs[2]]
 
     def __call__(self, inputs):
         if float(self.min) == 0 and float(self.max) == 6:
@@ -88,26 +95,27 @@ class TFGlobalAveragePool():
 class TFAveragePool():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs) -> None:
         super().__init__()
-        kernel_shape = node_attribute.get("kernel_shape", [2, 2])
-        strides = strides=node_attribute.get("strides", [1, 1])
+        kernel_shape = intfloat_to_list(node_attribute.get("kernel_shape", [2, 2]), 2)
+        strides = intfloat_to_list(node_attribute.get("strides", [1, 1]), 2)
+        dilations = intfloat_to_list(node_attribute.get("dilations", [1, 1]), 2)
         ceil_mode = node_attribute.get("ceil_mode", 0)
-        pads = node_attribute.get("pads", [0, 0, 0, 0])
+        pads = intfloat_to_list(node_attribute.get("pads", [0, 0, 0, 0]), 4)
 
-        inputshape = tensor_grap[node_inputs[0]].shape
-        half_shape = True
-        for i in range(len(inputshape)-2):
-            if ceil_mode == 0:
-                half_shape = half_shape and math.floor((inputshape[1+i]+pads[i]-((kernel_shape[i]-1)*1+1))/strides[i]+1) * 2 == inputshape[1+i]
-            else:
-                half_shape = half_shape and math.ceil((inputshape[1+i]+pads[i]-((kernel_shape[i]-1)*1+1))/strides[i]+1) * 2 == inputshape[1+i]
-
-        half_shape = half_shape and np.sum(pads) == 0
-        pad_mode = "SAME" if half_shape else "VALID" 
-        self.avg_pool = keras.layers.AveragePooling2D(pool_size=node_attribute.get("kernel_shape", [2])[0], 
-                                                        strides=node_attribute.get("strides", [1])[0], padding=pad_mode)
+        func = math.floor if ceil_mode == 0 else math.ceil
+        
+        pad_mode = "SAME"
+        input_shape = tensor_grap[node_inputs[0]].shape
+        for i in range(len(input_shape)-2):
+            pad_shape = pads[i] + pads[i+2]
+            output_shape_raw = (input_shape[1+i]+pad_shape-((kernel_shape[i]-1)*dilations[i]+1))/strides[i]+1
+            if func(output_shape_raw) != input_shape[1+i]:
+                pad_mode = "VALID"
+                break
+        
+        self.avg_pool = keras.layers.AveragePooling2D(pool_size=kernel_shape[0], strides=strides[0], padding=pad_mode)
         
         self.pad = None
-        if not half_shape and pads is not None and np.sum(pads) > 0:
+        if pad_mode == "VALID" and pads is not None and np.sum(pads) > 0:
             self.pad = keras.layers.ZeroPadding2D(padding=((pads[0], pads[2]), (pads[1], pads[3])))
 
     def __call__(self, inputs):
@@ -119,28 +127,28 @@ class TFAveragePool():
 class TFMaxPool():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs) -> None:
         super().__init__()
-        kernel_shape = node_attribute.get("kernel_shape", [2, 2])
-        strides = strides=node_attribute.get("strides", [1, 1])
+        kernel_shape = intfloat_to_list(node_attribute.get("kernel_shape", [2, 2]), 2)
+        strides = intfloat_to_list(node_attribute.get("strides", [1, 1]), 2)
+        dilations = intfloat_to_list(node_attribute.get("dilations", [1, 1]), 2)
         ceil_mode = node_attribute.get("ceil_mode", 0)
-        pads = node_attribute.get("pads", [0, 0, 0, 0])
+        pads = intfloat_to_list(node_attribute.get("pads", [0, 0, 0, 0]), 4)
 
-        inputshape = tensor_grap[node_inputs[0]].shape
-        half_shape = True
-        for i in range(len(inputshape)-2):
-            if ceil_mode == 0:
-                half_shape = half_shape and math.floor((inputshape[1+i]+pads[i]-((kernel_shape[i]-1)*1+1))/strides[i]+1) * 2 == inputshape[1+i]
-            else:
-                half_shape = half_shape and math.ceil((inputshape[1+i]+pads[i]-((kernel_shape[i]-1)*1+1))/strides[i]+1) * 2 == inputshape[1+i]
+        func = math.floor if ceil_mode == 0 else math.ceil
 
-        half_shape = half_shape and np.sum(pads) == 0
-        pad_mode = "SAME" if half_shape else "VALID" 
-        self.max_pool = keras.layers.MaxPool2D(pool_size=node_attribute.get("kernel_shape", [2])[0], 
-                                                 strides=node_attribute.get("strides", [1])[0], padding=pad_mode)
+        pad_mode = "SAME"
+        input_shape = tensor_grap[node_inputs[0]].shape
+        for i in range(len(input_shape)-2):
+            pad_shape = pads[i] + pads[i+2]
+            output_shape_raw = (input_shape[1+i]+pad_shape-((kernel_shape[i]-1)*dilations[i]+1))/strides[i]+1
+            if func(output_shape_raw) != input_shape[1+i]:
+                pad_mode = "VALID"
+                break
+
+        self.max_pool = keras.layers.MaxPool2D(pool_size=kernel_shape[0], strides=strides[0], padding=pad_mode)
         
         self.pad = None
-        if not half_shape and pads is not None and np.sum(pads) > 0:
+        if pad_mode == "VALID" and pads is not None and np.sum(pads) > 0:
             self.pad = keras.layers.ZeroPadding2D(padding=((pads[0], pads[2]), (pads[1], pads[3])))
-            
 
     def __call__(self, inputs):
         if self.pad:
@@ -195,16 +203,15 @@ class TFScatterND():
 class TFResize():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs):
         super().__init__()
-        if len(node_inputs) == 4:
-            # 从sizes取
-            _, _, nh, nw = node_weights[node_inputs[3]]
+        if node_inputs[-1] in node_weights:
+            _, _, nh, nw = node_weights[node_inputs[-1]]
+            if len(node_inputs) != 4:
+                _, h, w, _ = tensor_grap[node_inputs[0]].shape
+                nh, nw = int(h*nh), int(w*nw)
+            self.scale = (nh, nw)
         else:
-            # 从scales取
-            _, _, nh, nw = node_weights[node_inputs[2]]
-            _, h, w, _ = tensor_grap[node_inputs[0]].shape
-            nh, nw = int(h*nh), int(w*nw)
-        
-        self.scale = (nh, nw)
+            raise KeyError("dynamic size is not supported for Resize in tflite, please fix scale before export onnx...")
+
         if node_attribute.get("mode", "nearest").lower() == 'nearest':
             self.method = tf.image.ResizeMethod.NEAREST_NEIGHBOR
         else:
@@ -220,23 +227,15 @@ class TFGemm():
     '''
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs) -> None:
         super().__init__()
-        weights = node_weights[node_inputs[1]].T
-        bias = node_weights[node_inputs[2]] if len(node_inputs) > 2 else None
-        weights = weights
-        if bias is None:
-            self.dense = keras.layers.Dense(weights.shape[1],
-                                            input_shape=(weights.shape[0],),
-                                            activation=None,
-                                            use_bias=False,
-                                            kernel_initializer=keras.initializers.Constant(weights))
+        if len(node_inputs) > 2:
+            weights = [node_weights[node_inputs[1]].T, node_weights[node_inputs[2]]]
         else:
-            bias = bias[None, ...]
-            self.dense = keras.layers.Dense(weights.shape[1],
-                                            input_shape=(weights.shape[0],),
-                                            activation=None,
-                                            use_bias=True,
-                                            kernel_initializer=keras.initializers.Constant(weights),
-                                            bias_initializer=keras.initializers.Constant(bias))
+            weights = [node_weights[node_inputs[1]].T]
+
+        self.dense = keras.layers.Dense(weights[0].shape[1],
+                                        weights=weights,
+                                        use_bias=len(weights)==2)
+
     def __call__(self, inputs):
         return self.dense(inputs)
 
@@ -302,3 +301,11 @@ class TFCast():
                 inputs = tf.cast(inputs, dtype=self.tf_cast_map[self.cast_to])
 
         return inputs
+
+@OPERATOR.register_operator("Shape")
+class TFShape:
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    def __call__(self, inputs):
+        return tf.shape(inputs)

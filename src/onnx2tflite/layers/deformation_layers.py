@@ -1,10 +1,34 @@
 import logging
 import tensorflow as tf
 
-from . import OPERATOR
+from ..utils.op_registry import OPERATOR
 from . import dimension_utils
 
 LOG = logging.getLogger("deformation_layers :")
+
+TRANSPOSE_WITH_TFLITE_COMPAT = False
+
+
+def tflite_compat_transpose(tensor, perm):
+    """
+    Apply transpose that is compatible with TFLite.
+    This only works for tensors with static shapes.
+    """
+    # builtin tflite supports transpose of up to 5 dimensions
+    TFLITE_MAX_TRANSPOSE_RANK = 5
+    if tensor.shape.rank <= TFLITE_MAX_TRANSPOSE_RANK or not TRANSPOSE_WITH_TFLITE_COMPAT:
+        return tf.transpose(tensor, perm)
+
+    perm = tf.convert_to_tensor(perm)
+    # unstack along the new zeroth axis
+    new_first_axis = perm[0]
+    new_perm = perm[1:] - tf.cast(perm[1:] > new_first_axis, tf.int32)
+    tensors = tf.unstack(tensor, axis=new_first_axis)
+    # recursively transpose lower-ranked tensors
+    tensors = [tflite_compat_transpose(t, new_perm) for t in tensors]
+    # restack on axis 0
+    return tf.stack(tensors, axis=0)
+
 
 @OPERATOR.register_operator("Transpose")
 class TFTranspose():
@@ -30,12 +54,12 @@ class TFTranspose():
 
     def __call__(self, inputs):
         if self.trans_in and self.trans_out:
-            inputs = tf.transpose(inputs, perm=self.trans_in)
-            inputs = tf.transpose(inputs, perm=self.perm_list)
-            inputs = tf.transpose(inputs, perm=self.trans_out)
+            inputs = tflite_compat_transpose(inputs, perm=self.trans_in)
+            inputs = tflite_compat_transpose(inputs, perm=self.perm_list)
+            inputs = tflite_compat_transpose(inputs, perm=self.trans_out)
             return inputs
         else:
-            return tf.transpose(inputs, perm=self.perm_list)
+            return tflite_compat_transpose(inputs, perm=self.perm_list)
 
 @OPERATOR.register_operator("Slice")
 class TFSlice():
@@ -75,59 +99,67 @@ class TFGather():
 class TFConcat():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs):
         super().__init__()
-        _axis = dimension_utils.channel_to_last_dimension(node_attribute['axis'])
-        _gather = [tensor_grap[x] for x in node_inputs]
-        self.out = tf.concat(_gather, axis=_axis)
+        self._axis = dimension_utils.channel_to_last_dimension(node_attribute['axis'])
+        self._gather = [tensor_grap[x] if x in tensor_grap else dimension_utils.tensor_NCD_to_NDC_format(node_weights[x]) for x in node_inputs]
 
     def __call__(self, *args, **kwargs):
-        return self.out
+        return tf.concat(self._gather, axis=self._axis)
 
 @OPERATOR.register_operator("Reshape")
 class TFReshape():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs):
         super().__init__()
-        self.out_shape = node_weights[node_inputs[1]]
+        shape_name = node_inputs[1]
+        if shape_name in node_weights:
+            self.out_shape = node_weights[shape_name]
+        else:
+            self.out_shape = tensor_grap[shape_name]
         self.trans_in, self.trans_out = None, None
         LOG.info("Reshape will process tensor after change back to NCHW format.")
         shape_len = len(tensor_grap[node_inputs[0]].shape)
-        self.trans_in = [0, shape_len-1] + [n for n in range(1, shape_len-1)]
-        self.trans_out = [0] + [n for n in range(2, len(self.out_shape))] + [1]
+        self.trans_in = [0, shape_len - 1] + [n for n in range(1, shape_len - 1)]
+        self.trans_out = [0] + [n for n in range(2, self.out_shape.shape[0])] + [1]
 
     def __call__(self, inputs):
-        inputs = tf.transpose(inputs, perm=self.trans_in)
+        inputs = tflite_compat_transpose(inputs, perm=self.trans_in)
         inputs = tf.reshape(inputs, shape=self.out_shape)
-        inputs = tf.transpose(inputs, perm=self.trans_out)
+        inputs = tflite_compat_transpose(inputs, perm=self.trans_out)
         return inputs
         
 @OPERATOR.register_operator("Flatten")
 class TFFlatten():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs)->None:
         super().__init__()
-        tensor_size, tensor_shape = 1, tensor_grap[node_inputs[0]].get_shape().as_list()
-        for n in tensor_shape:
-            tensor_size = tensor_size * max(n, 1)
-        if tensor_size == max(tensor_shape):
-            self.trans = None
-        else:
-            perm_list = [0, len(tensor_shape)-1]
-            for i in range(len(tensor_shape)-2):
-                perm_list.append(i+1)
-            self.trans = TFTranspose(None, None, None, None, perm_list=perm_list)
+
+        self.axis = node_attribute.get("axis", 1)
+        if self.axis < 0:
+            raise ValueError("Negative axis not supported yet")
 
     def __call__(self, inputs):
-        if self.trans:
-            inputs = self.trans(inputs)
-        return tf.reshape(inputs, shape=(1, -1))
+        # transpose to channels-first
+        axes = tuple(range(len(inputs.shape)))
+        axes_perm = axes[0:1] + axes[-1:] + axes[1:-1]
+        inputs = tflite_compat_transpose(inputs, perm=axes_perm)
+
+        # flatten
+        inputs_shape = tf.shape(inputs)
+        new_shape = tf.concat(
+            [inputs_shape[0 : self.axis], tf.math.reduce_prod(inputs_shape[self.axis :], keepdims=True)], axis=0
+        )
+        inputs = tf.reshape(inputs, new_shape)
+        return inputs
+
 
 @OPERATOR.register_operator("Split")
 class TFSplit():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs)->None:
         super().__init__()
-        index = kwargs.get('index', 0)
+        split = node_weights[node_inputs[1]]
+        index = kwargs.get("index", 0)
         start = 0
         for i in range(index):
-            start += int(node_attribute['split'][i])
-        end = start + node_attribute['split'][index]
+            start += int(split[i])
+        end = start + split[index]
         self.indices = tf.keras.backend.arange(start, end, 1)
         self.axis = dimension_utils.channel_to_last_dimension(node_attribute.get("axis", 0))
 
@@ -161,7 +193,35 @@ class TFUnsqueeze():
 class TFSqueeze():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs)->None:
         super().__init__()
-        self.axis = dimension_utils.channel_to_last_dimension(node_attribute['axes'][0])
+        axis = node_attribute.get('axes')
+        if axis is None and len(node_inputs) > 1:
+            axis = node_weights[node_inputs[1]]
+
+        self.axis = dimension_utils.channel_to_last_dimension(axis[0])
 
     def __call__(self, inputs):
         return tf.squeeze(inputs, self.axis)
+
+@OPERATOR.register_operator("DepthToSpace")
+class TFDepthToSpace():
+    def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, *args, **kwargs)->None:
+        super().__init__()
+        self.block_size = node_attribute.get("blocksize", 2)
+        self.mode = node_attribute.get("mode", "DCR")
+
+    def __call__(self, inputs):
+        if self.mode == "DCR":
+            return tf.nn.depth_to_space(inputs, self.block_size)
+        elif self.mode == "CRD":
+            # help want, native tensorflow is not support CRD mode, this way will generate 5 dims op.
+            b, h, w, c = inputs.shape
+            tmp = tf.reshape(
+                inputs, [b, h, w, c // (self.block_size * self.block_size), self.block_size, self.block_size]
+            )
+            tmp = tflite_compat_transpose(tmp, perm=[0, 1, 4, 2, 5, 3])
+            tmp = tf.reshape(
+                tmp, [b, h * self.block_size, w * self.block_size, c // (self.block_size * self.block_size)]
+            )
+            return tmp
+        else:
+            raise KeyError(f"For DepthToSpace, mode must be [DCR, CRD], not {self.mode}")

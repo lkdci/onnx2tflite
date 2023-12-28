@@ -34,7 +34,7 @@ python converter.py --weights "./your_model.onnx" --formats "tflite" --int8
 ---
 ## Features
 - High Consistency. Compare to ONNX outputs, average error less than 1e-5 per elements.
-- More Faster. Output tensorflow-lite model 30% faster than [onnx_tf](https://github.com/onnx/onnx-tensorflow/blob/main/onnx_tf/common/attr_converter.py).
+- More Faster. Output tensorflow-lite model 30% faster than [onnx_tf](https://github.com/onnx/onnx-tensorflow).
 - Auto Channel Align. Auto convert pytorch format(NCWH) to tensorflow format(NWHC).
 - Deployment Support. Support output quantitative model, include fp16 quantization and uint8 quantization.
 - Code Friendly. I've been trying to keep the code structure simple and clear.
@@ -125,7 +125,7 @@ onnx_converter(
 - 2D CNN without special operators(custom)
 ---
 ## Add operator by yourself
-When you counter unspport operator, you can choose add it by yourself or make a issuse.<br/>
+When you counter unspported operator, you can choose to add it by yourself or make an issue.<br/>
 It's very simple to implement a new operator parser by following these steps below.<br/>
 Step 0: Select a corresponding layer code file in [layers folder](./layers/), such as activations_layers.py for 'HardSigmoid'.<br/>
 Step 1: Open it, and edit it:
@@ -155,6 +155,10 @@ Step 4: Run [comfirm_acc.py](./test/comfirm_acc.py), ensure outputs consistency.
 - [ ] support Transofomer, VIT\Swin Trasnformer etc...
 - [x] support cutoff onnx model and specify output layer
 - [ ] optimize [comfirm_acc.py](./test/comfirm_acc.py)
----
+
+## Emmmmmmm
+It's amazing, TFLite doesn't support multi-input quantization, if you know how to do please give me a PR. \
+It's too disgusting for first(batch) or second(channel) axis change. There are always circumstances that have not been taken into account.
+
 # License
 This software is covered by Apache-2.0 license.
