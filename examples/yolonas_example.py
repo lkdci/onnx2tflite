@@ -1,8 +1,12 @@
 import onnx
 import torch
-from onnx2tflite.utils.builder import keras_builder
 import tensorflow as tf
 import numpy as np
+from super_gradients.training import models
+from super_gradients.training.models.conversion import onnx_simplify
+
+from onnx2tflite.utils.builder import keras_builder
+from examples.yolonas_tflite_compat import YoloNAS_S_TFLite
 
 
 class RandomDatasetGenerator:
@@ -24,14 +28,64 @@ class RandomDatasetGenerator:
             return [np.random.rand(*self.input_size).astype(np.float32)]
         raise StopIteration()
 
-
 if __name__ == '__main__':
+    torch_model = models.get(model_name="YoloNAS_S_TFLite", num_classes=80).eval()
+    # load state dict
+    yolo_nas_model_weights = models.get(model_name="yolo_nas_s", num_classes=80, pretrained_weights="coco").eval()
+    torch_model.load_state_dict(yolo_nas_model_weights.state_dict())
+
     input_size = [1, 3, 640, 640]
     channel_last_size = [input_size[0], input_size[2], input_size[3], input_size[1]]
     x_nchw = torch.randn(*input_size)
     quantize = True
 
+    # state dict sanity check
+    with torch.no_grad():
+        (x1, x2), _ = torch_model(x_nchw)
+        (y1, y2), _ = yolo_nas_model_weights(x_nchw)
+        print(f"{'=' * 20} DIFF sanity check")
+        diff_cls = torch.abs(y2 - x2.permute(0, 2, 1))
+        print(f"DIFF cls preds: mean = {diff_cls.mean()}, max = {diff_cls.max()}")
+        diff_reg = torch.abs(y1 - x1.squeeze(1))
+        print(f"DIFF cls preds: mean = {diff_reg.mean()}, max = {diff_reg.max()}")
+        print(f"{'=' * 20}")
+
+    torch_model.prep_model_for_conversion([1, 3, 640, 640])
     onnx_path = "/Users/liork/Downloads/yolonas_s_for_tflite.onnx"
+    torch.onnx.export(torch_model, x_nchw, onnx_path, opset_version=13)
+    onnx_simplify(onnx_path, onnx_path)
+
+    # Edit onnx model with custom ops
+    onnx_model = onnx.load_model(onnx_path)
+
+    i = 0
+    counter = 0
+    value_dict = {attr.name: attr for attr in onnx_model.graph.value_info}
+    initializer_dict = {attr.name: attr for attr in onnx_model.graph.initializer}
+    while i < len(onnx_model.graph.node):
+        if "/heads/" in onnx_model.graph.node[i].name and onnx_model.graph.node[i].op_type == "Reshape" and \
+                onnx_model.graph.node[i + 1].op_type == "Transpose" and onnx_model.graph.node[
+            i + 2].op_type == "Softmax":
+            output_edge = onnx_model.graph.node[i + 1].output[0]
+            dims = [d.dim_value for d in value_dict[output_edge].type.tensor_type.shape.dim]
+            num_regs = dims[1]
+            anchor_size = dims[2]
+            new_node = onnx.helper.make_node(
+                inputs=list(onnx_model.graph.node[i].input),
+                outputs=list(onnx_model.graph.node[i + 1].output),
+                name=f"/DFL_Reshape{counter}",
+                op_type="DFLReshape",
+                num_regs=num_regs,
+                anchor_size=anchor_size
+            )
+            onnx_model.graph.node.insert(i, new_node)
+            del onnx_model.graph.node[i + 2]
+            del onnx_model.graph.node[i + 1]
+        i += 1
+
+    onnx.save_model(onnx_model, onnx_path)
+
+    # Convert to tflite
     tflite_path = onnx_path.replace(".onnx", "_quant.tflite" if quantize else ".tflite")
 
     onnx_model = onnx.load_model(onnx_path)
