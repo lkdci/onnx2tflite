@@ -13,7 +13,6 @@ from super_gradients.common.registry import register_model
 from super_gradients.training.models import get_arch_params
 from super_gradients.training.utils import HpmStruct, get_param
 
-
 @register_model()
 class YoloNAS_S_TFLite(YoloNAS):
     def __init__(self, arch_params):
@@ -32,6 +31,42 @@ class YoloNAS_S_TFLite(YoloNAS):
             inplace_act=get_param(merged_arch_params, "inplace_act", None),
         )
 
+
+@register_model()
+class YoloNAS_M_TFLite(YoloNAS):
+    def __init__(self, arch_params):
+        default_arch_params = get_arch_params("yolo_nas_m_arch_params")
+        default_arch_params["heads"]["NDFLHeadsTFlite"] = default_arch_params["heads"].pop("NDFLHeads")
+        merged_arch_params = HpmStruct(**copy.deepcopy(default_arch_params))
+        merged_arch_params.override(**arch_params.to_dict())
+        super().__init__(
+            backbone=merged_arch_params.backbone,
+            neck=merged_arch_params.neck,
+            heads=merged_arch_params.heads,
+            num_classes=get_param(merged_arch_params, "num_classes", None),
+            in_channels=get_param(merged_arch_params, "in_channels", 3),
+            bn_momentum=get_param(merged_arch_params, "bn_momentum", None),
+            bn_eps=get_param(merged_arch_params, "bn_eps", None),
+            inplace_act=get_param(merged_arch_params, "inplace_act", None),
+        )
+
+@register_model()
+class YoloNAS_L_TFLite(YoloNAS):
+    def __init__(self, arch_params):
+        default_arch_params = get_arch_params("yolo_nas_l_arch_params")
+        default_arch_params["heads"]["NDFLHeadsTFlite"] = default_arch_params["heads"].pop("NDFLHeads")
+        merged_arch_params = HpmStruct(**copy.deepcopy(default_arch_params))
+        merged_arch_params.override(**arch_params.to_dict())
+        super().__init__(
+            backbone=merged_arch_params.backbone,
+            neck=merged_arch_params.neck,
+            heads=merged_arch_params.heads,
+            num_classes=get_param(merged_arch_params, "num_classes", None),
+            in_channels=get_param(merged_arch_params, "in_channels", 3),
+            bn_momentum=get_param(merged_arch_params, "bn_momentum", None),
+            bn_eps=get_param(merged_arch_params, "bn_eps", None),
+            inplace_act=get_param(merged_arch_params, "inplace_act", None),
+        )
 
 @register_detection_module()
 class NDFLHeadsTFlite(NDFLHeads):
@@ -80,3 +115,5 @@ class NDFLHeadsTFlite(NDFLHeads):
     def _generate_anchors(self, feats=None, dtype=None, device=None):
         anchor_points, stride_tensor = super()._generate_anchors(feats, dtype, device)
         return anchor_points.unsqueeze(0).unsqueeze(0), stride_tensor.unsqueeze(0).unsqueeze(0)
+
+

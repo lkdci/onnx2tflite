@@ -7,35 +7,19 @@ import super_gradients
 import tensorflow as tf
 import torch
 from omegaconf import DictConfig
+from super_gradients.training import dataloaders
+from super_gradients.training import models
 from super_gradients.training.datasets.detection_datasets import COCODetectionDataset
 from super_gradients.training.metrics import DetectionMetrics
+from super_gradients.training.models.conversion import onnx_simplify
 from super_gradients.training.models.detection_models.pp_yolo_e import PPYoloEPostPredictionCallback
 from super_gradients.training.utils import get_param
 from tqdm import tqdm
-from super_gradients.training import dataloaders
+
 from src.onnx2tflite.utils.builder import keras_builder
-from super_gradients.training import models
-from super_gradients.training.models.conversion import onnx_simplify
-from examples.yolonas_tflite_compat import YoloNAS_S_TFLite
 
 
-def create_onnx_model_example():
-    from torchvision.models import resnet50, ResNet50_Weights
-    model = resnet50(weights=ResNet50_Weights.DEFAULT)
-    model.eval()
-
-    dummy_input = torch.zeros(1, 3, 224, 224)  # BCHW
-    torch.onnx.export(model,
-                      dummy_input,
-                      'resnet_50.onnx',
-                      verbose=False, opset_version=15,
-                      training=torch.onnx.TrainingMode.EVAL,
-                      do_constant_folding=True,
-                      input_names=['input'],
-                      output_names=['output'],
-                      dynamic_axes=None)
-
-
+# Calibration Datasets for tflite converter
 class COCODatasetGenerator:
     def __init__(self, dataset, input_size, num_samples: int = 1):
         self.input_size = input_size
@@ -78,13 +62,31 @@ class RandomDatasetGenerator:
         self.counter += 1
         if self.counter <= self.num_samples:
             print(f"num samples is {self.counter}")
-            # Random input
             return [np.random.rand(*self.input_size).astype(np.float32)]
         raise StopIteration()
 
 
-def eval_tflite_model(tflite_path, x_nchw, dataset):
+def eval_tflite_model_coco_dataset(tflite_path, cfg):
+    """
+    Evaluate a TFLite model using the COCO dataset.
+
+    Parameters:
+    - tflite_path (str): Path to the TFLite model file.
+    - cfg (Config): Configuration object containing evaluation parameters.
+
+    Returns:
+    None
+
+    Raises:
+    - FileNotFoundError: If the specified TFLite model file is not found.
+    """
+
     print(f'Start evaluate tflite model with path {tflite_path}')
+    val_dataloader = dataloaders.get(
+        name=get_param(cfg, "val_dataloader"),
+        dataset_params=cfg.dataset_params.val_dataset_params,
+        dataloader_params=cfg.dataset_params.val_dataloader_params)
+
     tf.lite.experimental.Analyzer.analyze(
         model_path=tflite_path, model_content=None, gpu_compatibility=True
     )
@@ -93,28 +95,16 @@ def eval_tflite_model(tflite_path, x_nchw, dataset):
     interpreter = tf.lite.Interpreter(model_path=tflite_path)
     interpreter.allocate_tensors()
 
-    # Get input and output tensors
+    # # Get input and output tensors
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
-
-    # Test the model on random input data
-    input_shape = input_details[0]['shape']
-    interpreter.set_tensor(input_details[0]['index'], x_nchw.permute(0, 2, 3, 1).numpy())
-    interpreter.invoke()
-
-    # get_tensor() returns a copy of the tensor data
-    # use tensor() in order to get a pointer to the tensor
-    output_data_bbox = interpreter.get_tensor(output_details[0]['index'])
-    output_data_cls = interpreter.get_tensor(output_details[1]['index'])
-    print(output_data_bbox.shape)
-    print(output_data_cls.shape)
 
     post_prediction_callback = PPYoloEPostPredictionCallback(score_threshold=0.1, max_predictions=300, nms_top_k=1000,
                                                              nms_threshold=0.7)
     metric = DetectionMetrics(score_thres=0.1, top_k_predictions=300, num_cls=80, normalize_targets=True,
                               post_prediction_callback=post_prediction_callback)
 
-    for i, data in tqdm(enumerate(dataset)):
+    for i, data in tqdm(enumerate(val_dataloader)):
         label = torch.tensor(data[1])
         preds = []
         img = np.transpose(data[0], (0, 2, 3, 1))
@@ -137,8 +127,9 @@ def eval_tflite_model(tflite_path, x_nchw, dataset):
     print(f"detection_metric result:\t {detection_metric}")
 
 
-def eval_torch_model(eval_dataset):
+def eval_yolonas_torch_model_coco(eval_dataset):
     print(f'Start evaluate torch model')
+    # todo maybe to change this?
     torch_model = models.get(model_name="YoloNAS_S_TFLite", num_classes=80).eval()
     # load state dict
     yolo_nas_model_weights = models.get(model_name="yolo_nas_s", num_classes=80, pretrained_weights="coco").eval()
@@ -168,10 +159,11 @@ def eval_torch_model(eval_dataset):
     print(f"detection_metric result:\t {detection_metric}")
 
 
-def create_yolonas_onnx(onnx_path):
-    torch_model = models.get(model_name="YoloNAS_L_TFLite", num_classes=80).eval()
+def create_yolonas_onnx(onnx_path, model_name="YoloNAS_L_TFLite", checkpoint_model_name="yolo_nas_l"):
+    torch_model = models.get(model_name=model_name, num_classes=80).eval()
     # load state dict
-    yolo_nas_model_weights = models.get(model_name="yolo_nas_l", num_classes=80, pretrained_weights="coco").eval()
+    yolo_nas_model_weights = models.get(model_name=checkpoint_model_name, num_classes=80,
+                                        pretrained_weights="coco").eval()
     torch_model.load_state_dict(yolo_nas_model_weights.state_dict())
 
     input_size = [1, 3, 640, 640]
@@ -224,22 +216,31 @@ def create_yolonas_onnx(onnx_path):
     onnx.save_model(onnx_model, onnx_path)
 
 
-def calc_quantization_stats(converter, result_file="result_tflite_quant.csv"):
+def calculate_quantization_stats(converter, result_file="result_tflite_quant.csv"):
     debugger = tf.lite.experimental.QuantizationDebugger(
         converter=converter, debug_dataset=converter.representative_dataset)
+
     debugger.run()
 
     with open(result_file, 'w') as f:
         debugger.layer_statistics_dump(f)
 
 
-def print_keras_model_layers(keras_mnodel):
-    for i, layer in enumerate(keras_mnodel.layers):
-        print(f"Layer {i}: {layer.name}")
-
 def parse_args():
-    parser = argparse.ArgumentParser(description='My Hydra Application')
-    parser.add_argument('--my_arg', type=int, help='An example argument')
+    parser = argparse.ArgumentParser(description='Parser for Model Evaluation and Compilation')
+    parser.add_argument('eval_model', type=bool, default=False,
+                        help='Perform model evaluation. Set to True to enable model evaluation.')
+    parser.add_argument('compile_model', type=bool, default=True,
+                        help='Compile the model for deployment. Set to True to enable model compilation.')
+    parser.add_argument('quantize_model_int8', type=bool, default=True,
+                        help='Quantize the model to INT8 format. Set to True to enable INT8 quantization.')
+    parser.add_argument('model_input_size', type=list, default=[1, 3, 640, 640],
+                        help='Set the input size for the model. Provide a list of integers representing the input '
+                             'size, e.g., [batch_size, channels, height, width].')
+    parser.add_argument('onnx_path', type=str, default="yolonas_l_for_tflite.onnx",
+                        help='Path to the ONNX model file. Specify the ONNX model file for evaluation, compilation, '
+                             'or quantization.')
+
     return parser
 
 
@@ -247,64 +248,53 @@ def parse_args():
 def run(cfg: DictConfig):
     cfg = hydra.utils.instantiate(cfg)
     args = parse_args().parse_args()
-    eval = True
-    compile = True
-    quantize = True
-    input_size = [1, 3, 640, 640]
-    channel_last_size = [input_size[0], input_size[2], input_size[3], input_size[1]]
-    x_nchw = torch.randn(*input_size)
 
-    onnx_path = "yolonas_l_for_tflite.onnx"
-    tflite_path = onnx_path.replace(".onnx", "_quant.tflite" if quantize else ".tflite")
+    tflite_path = args.onnx_path.replace(".onnx", "_quant.tflite" if args.quantize_model_int8 else ".tflite")
 
-    if compile:
-        create_yolonas_onnx(onnx_path)
-        onnx_model = onnx.load_model(onnx_path)
-        keras_model = keras_builder(
-            onnx_model=onnx_model, native_groupconv=True, tflite_compat=True
-        )
-
+    if args.compile_model:
+        # Create yolonas onnx model
+        create_yolonas_onnx(args.onnx_path)
+        onnx_model = onnx.load_model(args.onnx_path)
+        keras_model = keras_builder(onnx_model=onnx_model, native_groupconv=True, tflite_compat=True)
 
         converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+        # Sets the TensorFlow Lite operations supported by the converter
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]  # , tf.lite.OpsSet.SELECT_TF_OPS]
 
-        if quantize:
+        if args.quantize_model_int8:
+            channel_last_size = [args.model_input_size[0], args.model_input_size[2], args.model_input_size[3],
+                                 args.model_input_size[1]]
+
             dataset_val = COCODetectionDataset(**cfg.dataset_params.val_dataset_params)
             converter.representative_dataset = COCODatasetGenerator(input_size=channel_last_size, num_samples=500,
                                                                     dataset=dataset_val).iterator
-
+            # Disables per-channel quantization
             converter._experimental_disable_per_channel = True
             converter.experimental_new_converter = True
             converter.experimental_new_quantizer = True
             converter.optimizations = [
-                tf.lite.Optimize.DEFAULT]  # in their code is [tf.lite.Optimize.DEFAULT, tf.lite.OpsSet.SELECT_TF_OPS]
+                tf.lite.Optimize.DEFAULT]  # in their code (nxp) is [tf.lite.Optimize.DEFAULT, tf.lite.OpsSet.SELECT_TF_OPS]
 
             # converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
             converter.target_spec.supported_types = []
-
             try:
+                # Using the debugger you can watch (in the csv output) the error per layer/operator while doing
+                # quantization to int8. After a csv file been created you can choose the layers you want to
+                # exclude from quantization to int8, and preserve them as float16 (selective quantization) -
+                # insert them to a list like "suspected_layers"
+                calculate_quantization_stats(converter=converter)
+                suspected_layers = ['StatefulPartitionedCall:0', 'model/tf.concat_15/concat',
+                                    'model/tf.math.subtract/Sub', 'model/tf.__operators__.add_28/AddV2']
 
-                # calc_quantization_stats(converter=converter,  result_file="result_tflite_quant_yolonas_l.csv")
-                # stop = "here"
-
-                # tflite_model = converter.convert()
-
-                tflite_path = "yolonas_l_for_tflite_selctive_quant.tflite"
-                # suspected_layers = ['StatefulPartitionedCall:0', 'model/tf.math.subtract/Sub',
-                #                     'model/tf.concat_15/concat','model/tf.__operators__.add_20/AddV2']
-                suspected_layers_yolonas_l = ['StatefulPartitionedCall:0', 'model/tf.concat_15/concat',
-                                              'model/tf.math.subtract/Sub', 'model/tf.__operators__.add_28/AddV2']
-                debug_options = tf.lite.experimental.QuantizationDebugOptions(
-                    denylisted_nodes=suspected_layers_yolonas_l)
+                debug_options = tf.lite.experimental.QuantizationDebugOptions(denylisted_nodes=suspected_layers)
 
                 debugger = tf.lite.experimental.QuantizationDebugger(
                     converter=converter,
                     debug_dataset=converter.representative_dataset,
                     debug_options=debug_options)
 
-                print(f"Compile model to tflite with Selective Quantization, emitted layers: "
-                      f" {suspected_layers_yolonas_l}, saves in path {tflite_path}")
-
+                print(
+                    f"Compile model to tflite with Selective Quantization, emitted layers: {suspected_layers}, saves in path {tflite_path}")
                 tflite_model = debugger.get_nondebug_quantized_model()
 
             except Exception as e:
@@ -312,21 +302,25 @@ def run(cfg: DictConfig):
                     "======================== Turn off `experimental_new_quantizer`, and try again ======================")
                 print(e)
                 converter.experimental_new_quantizer = False
-                tflite_model = converter.convert()
+
+                suspected_layers = []
+                debug_options = tf.lite.experimental.QuantizationDebugOptions(denylisted_nodes=suspected_layers)
+                debugger = tf.lite.experimental.QuantizationDebugger(
+                    converter=converter,
+                    debug_dataset=converter.representative_dataset,
+                    debug_options=debug_options)
+
+                tflite_model = debugger.get_nondebug_quantized_model()
+
         else:
+            # FP16
             tflite_model = converter.convert()
 
         with open(tflite_path, "wb") as fp:
             fp.write(tflite_model)
 
-    if eval:
-        val_dataloader = dataloaders.get(
-            name=get_param(cfg, "val_dataloader"),
-            dataset_params=cfg.dataset_params.val_dataset_params,
-            dataloader_params=cfg.dataset_params.val_dataloader_params)
-
-        # eval_torch_model(eval_dataset=val_dataloader)
-        eval_tflite_model(tflite_path=tflite_path, x_nchw=x_nchw, dataset=val_dataloader)
+    if args.eval_model:
+        eval_tflite_model_coco_dataset(tflite_path=tflite_path, cfg=cfg)
 
 
 if __name__ == '__main__':
