@@ -51,7 +51,7 @@ if __name__ == '__main__':
         print(f"{'=' * 20}")
 
     torch_model.prep_model_for_conversion([1, 3, 640, 640])
-    onnx_path = "/Users/liork/Downloads/yolonas_s_for_tflite.onnx"
+    onnx_path = "/Users/liork/Downloads/yolonas_s_for_tflite_b.onnx"
     torch.onnx.export(torch_model, x_nchw, onnx_path, opset_version=13)
     onnx_simplify(onnx_path, onnx_path)
 
@@ -80,6 +80,17 @@ if __name__ == '__main__':
             )
             onnx_model.graph.node.insert(i, new_node)
             del onnx_model.graph.node[i + 2]
+            del onnx_model.graph.node[i + 1]
+        elif "/heads/" in onnx_model.graph.node[i].name and onnx_model.graph.node[i].op_type == "Reshape":
+            output_edge = onnx_model.graph.node[i].output[0]
+            dims = [d.dim_value for d in value_dict[output_edge].type.tensor_type.shape.dim]
+            new_node = onnx.helper.make_node(
+                inputs=list(onnx_model.graph.node[i].input),
+                outputs=list(onnx_model.graph.node[i].output),
+                name=f"/Cls_Reshape{counter}",
+                op_type="ClsReshape",
+            )
+            onnx_model.graph.node.insert(i, new_node)
             del onnx_model.graph.node[i + 1]
         i += 1
 
