@@ -1,7 +1,9 @@
 import logging
 import numpy as np
 import tensorflow as tf
-from keras.engine.keras_tensor import KerasTensor
+from keras.src.engine.keras_tensor import KerasTensor
+# TODO - conditional import for older version of keras
+# from keras.engine.keras_tensor import KerasTensor
 
 from ..utils.op_registry import OPERATOR
 from . import dimension_utils

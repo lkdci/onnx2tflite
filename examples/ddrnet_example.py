@@ -6,7 +6,7 @@ from onnx2tflite.utils.builder import keras_builder
 
 
 if __name__ == '__main__':
-    onnx_path = "/Users/liork/Downloads/deciav2.onnx"
+    onnx_path = "/Users/liork/Downloads/ddrnet23.onnx"
     tflite_path = onnx_path.replace(".onnx", ".tflite")
 
     onnx_model = onnx.load_model(onnx_path)
